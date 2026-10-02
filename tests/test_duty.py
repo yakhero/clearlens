@@ -12,41 +12,45 @@ CIF = Decimal("10000000")
 KW = dict(importer_status="commercial_filer", st_rate=Decimal("0.18"), acd_rate=Decimal("0.02"))
 
 
+# The worked example in the README: two codes from heading 07.03 of the FY 2026-27 tariff.
+# 0703.2000 Garlic is CD 0%; 0703.9000 Leeks and other alliaceous vegetables is CD 10%.
+
+
 def test_correct_code_cascade():
-    """CD 3%: the worked example in the PRD, computed to the rupee."""
-    r = duty.compute("0703.2000", CIF, Decimal("0.03"), **KW)
-    assert r.cd_amount == Decimal("300000.00")
+    """0703.2000 Garlic, CD 0%: the worked example in the README, computed to the rupee."""
+    r = duty.compute("0703.2000", CIF, Decimal("0.00"), **KW)
+    assert r.cd_amount == Decimal("0.00")
     assert r.acd_amount == Decimal("200000.00")
-    assert r.duty_paid_value == Decimal("10500000.00")
-    assert r.sales_tax == Decimal("1890000.00")
-    assert r.wht == Decimal("681450.00")
-    assert r.total_taxes == Decimal("3071450.00")
-    assert r.landed_cost == Decimal("13071450.00")
+    assert r.duty_paid_value == Decimal("10200000.00")
+    assert r.sales_tax == Decimal("1836000.00")
+    assert r.wht == Decimal("661980.00")
+    assert r.total_taxes == Decimal("2697980.00")
+    assert r.landed_cost == Decimal("12697980.00")
 
 
 def test_wrong_code_cascade():
-    """CD 20% on the same consignment."""
-    r = duty.compute("0712.9000", CIF, Decimal("0.20"), **KW)
-    assert r.cd_amount == Decimal("2000000.00")
-    assert r.duty_paid_value == Decimal("12200000.00")
-    assert r.sales_tax == Decimal("2196000.00")
-    assert r.wht == Decimal("791780.00")
-    assert r.total_taxes == Decimal("5187780.00")
+    """0703.9000 Leeks and other alliaceous vegetables, CD 10%, on the same consignment."""
+    r = duty.compute("0703.9000", CIF, Decimal("0.10"), **KW)
+    assert r.cd_amount == Decimal("1000000.00")
+    assert r.duty_paid_value == Decimal("11200000.00")
+    assert r.sales_tax == Decimal("2016000.00")
+    assert r.wht == Decimal("726880.00")
+    assert r.total_taxes == Decimal("3942880.00")
 
 
 def test_misclassification_compounds():
-    """A 17-point rate gap must produce a larger cost gap, because tax sits on tax."""
-    cmp = duty.compare_codes(CIF, ("0703.2000", Decimal("0.03")),
-                             ("0712.9000", Decimal("0.20")), **KW)
-    assert cmp["difference"] == Decimal("2116330.00")
-    assert cmp["difference_pct_of_cif"] == Decimal("21.16")
-    rate_gap = Decimal("20") - Decimal("3")
+    """A 10-point rate gap must produce a larger cost gap, because tax sits on tax."""
+    cmp = duty.compare_codes(CIF, ("0703.2000", Decimal("0.00")),
+                             ("0703.9000", Decimal("0.10")), **KW)
+    assert cmp["difference"] == Decimal("1244900.00")
+    assert cmp["difference_pct_of_cif"] == Decimal("12.45")
+    rate_gap = Decimal("10") - Decimal("0")
     assert cmp["difference_pct_of_cif"] > rate_gap   # the whole point of the product
 
 
 def test_non_filer_pays_more():
-    filer = duty.compute("0703.2000", CIF, Decimal("0.03"), **KW)
-    non_filer = duty.compute("0703.2000", CIF, Decimal("0.03"),
+    filer = duty.compute("0703.2000", CIF, Decimal("0.00"), **KW)
+    non_filer = duty.compute("0703.2000", CIF, Decimal("0.00"),
                              importer_status="commercial_non_filer",
                              st_rate=Decimal("0.18"), acd_rate=Decimal("0.02"))
     assert non_filer.total_taxes > filer.total_taxes
