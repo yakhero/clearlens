@@ -103,11 +103,64 @@ def test_single_line_heading_is_its_own_description():
     assert row["description"] == "Meat of horses, asses, mules or hinnies, fresh, chilled or frozen."
 
 
-def test_specific_duty_is_not_a_percentage():
-    """Page 30: CD on 1507.1000 is 'Rs. 10550/MT'. It must not appear as a percentage."""
-    assert tariff.lookup("1507.1000") == {}
+# Specific (fixed rupee) duties, read by eye off the PDF. Pages 29-32 and 177 print the amount
+# rotated and wrapped mid-number ("Rs." / "105" / "50/" / "MT"); 1518.0000 and page 249 print
+# it on one line.  (pct_code, specific_duty_text, own text, PDF page)
+SPECIFIC = [
+    ("1507.1000", "Rs. 10550/MT", "Crude oil, whether or not degummed", 30),     # soya-bean oil
+    ("1509.2000", "Rs. 5000/MT", "Extra virgin olive oil", 30),
+    ("1511.9010", "Rs. 9050/MT", "Palm stearin", 30),
+    ("1518.0000", "Rs. 10800/MT", "not elsewhere specified or included.", 32),
+    ("1404.9020", "Rs. 600/Kg", "Betel leaves", 29),
+    ("7106.9110", "Rs. 120/Kg", "50 kg and above", 176),                         # silver
+    ("7108.1210", "Rs. 2500/Kg", "5 Kg and above", 177),                         # gold
+    ("8517.1310", "Rs. 250/set", "Smartphones : > In CKD/SKD condition", 249),
+    ("8517.1419", "Rs. 250/set", "Cellular mobile phone: > Other", 249),
+    ("3706.1000", "Rs. 5 per meter", "Of a width of 35 mm or more", 92),
+]
+
+
+def test_specific_duty_rows_are_returned_with_their_printed_amount():
+    for code, text, own_text, page in SPECIFIC:
+        row = tariff.lookup(code)
+        assert row, f"{code} (page {page}) missing from pct_codes.csv"
+        assert row["duty_type"] == "specific", code
+        assert row["cd_rate"] == "", f"{code}: a specific duty must not carry a percentage"
+        assert row["specific_duty_text"] == text, f"{code} page {page}: {row['specific_duty_text']!r}"
+        assert row["description"].endswith(own_text), f"{code}: {row['description']!r}"
+
+
+def test_cd_fraction_refuses_specific_duty():
+    for code in ("1507.1000", "8517.1310"):                # edible oil, mobile phone
+        row = tariff.lookup(code)
+        try:
+            tariff.cd_fraction(row)
+        except tariff.SpecificDutyError as exc:
+            assert code in str(exc) and row["specific_duty_text"] in str(exc)
+            assert "manually" in str(exc)
+        else:
+            raise AssertionError(f"cd_fraction returned a number for specific-duty {code}")
+
+
+def test_specific_duty_error_is_a_value_error():
+    """Callers that already catch ValueError on a bad rate keep working."""
+    assert issubclass(tariff.SpecificDutyError, ValueError)
+
+
+def test_neighbours_of_specific_rows_stay_ad_valorem():
+    """Page 249: 8517.1420 sits between two Rs.250/set lines but is a plain 15%."""
+    row = tariff.lookup("8517.1420")
+    assert row["duty_type"] == "ad_valorem" and row["cd_rate"] == "15"
+    assert row["specific_duty_text"] == ""
+    assert tariff.cd_fraction(row) == Decimal("0.15")
+
+
+def test_all_specific_rows_are_listed_in_the_report():
+    rows = [r for r in tariff.load() if r["duty_type"] == "specific"]
+    assert len(rows) == 54
     report = tariff.REPORT_PATH.read_text(encoding="utf-8")
-    assert "1507.1000" in report and "not an ad valorem percentage" in report
+    for r in rows:
+        assert f"{r['pct_code']:<10}  {r['specific_duty_text']}" in report
 
 
 def test_line_without_its_heading_is_skipped_not_guessed():
@@ -139,7 +192,7 @@ def test_search_text_and_code_prefix():
     assert tariff.search("") == []
 
 
-def test_csv_shape_and_every_rate_is_a_number():
+def test_csv_shape_and_rate_columns():
     with open(tariff.CSV_PATH, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         assert reader.fieldnames == tariff.COLUMNS
@@ -148,7 +201,12 @@ def test_csv_shape_and_every_rate_is_a_number():
     codes = [r["pct_code"] for r in rows]
     assert len(codes) == len(set(codes))
     for r in rows:
-        Decimal(r["cd_rate"])                       # raises if a rate is not numeric
+        assert r["duty_type"] in ("ad_valorem", "specific")
+        if r["duty_type"] == "ad_valorem":
+            Decimal(r["cd_rate"])                   # raises if a rate is not numeric
+            assert r["specific_duty_text"] == ""
+        else:
+            assert r["cd_rate"] == "" and r["specific_duty_text"].startswith("Rs. ")
         assert r["description"]
 
 

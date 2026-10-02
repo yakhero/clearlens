@@ -11,11 +11,16 @@ keyed by dash depth and join the path:
 
     Live poultry, ... guinea fowls. > Weighing not more than 185 g: > Turkeys
 
-Rule: never invent a rate. A tariff line whose CD cell is empty, is a specific duty
-("Rs. 9050/MT") rather than a percentage, or whose code does not belong to the heading it sits
-under, is left out of the CSV and written to data/tariff/parse_report.txt with its page and
-raw text. Chapter 99 (concessions, four-digit codes, prose) is not a tariff schedule and is
-reported, not parsed.
+Rule: never invent a rate. Some lines carry a specific duty — a fixed rupee amount such as
+"Rs. 9050/MT" — instead of a percentage. They are kept with duty_type="specific", an empty
+cd_rate and the amount in specific_duty_text, so a caller can say why no percentage applies.
+In the PDF these amounts are printed rotated in a narrow cell and wrap mid-number
+("Rs." / "90" / "50/" / "MT"); the stored text drops those wrap breaks: "Rs. 9050/MT".
+
+A tariff line whose CD cell is empty or unreadable, or whose code does not belong to the
+heading it sits under, is left out of the CSV and written to data/tariff/parse_report.txt with
+its page and raw text. Chapter 99 (concessions, four-digit codes, prose) is not a tariff
+schedule and is reported, not parsed.
 
     python -m core.tariff        # rebuild the CSV and the report, print coverage
 """
@@ -32,7 +37,10 @@ TARIFF_DIR = ROOT / "data" / "tariff"
 PDF_PATH = TARIFF_DIR / "pakistan_customs_tariff_2026-27.pdf"
 CSV_PATH = TARIFF_DIR / "pct_codes.csv"
 REPORT_PATH = TARIFF_DIR / "parse_report.txt"
-COLUMNS = ["pct_code", "description", "cd_rate", "chapter", "heading"]
+COLUMNS = ["pct_code", "description", "cd_rate", "chapter", "heading",
+           "duty_type", "specific_duty_text"]
+AD_VALOREM = "ad_valorem"
+SPECIFIC = "specific"
 SEP = " > "
 
 # Column rules, in PDF points. They match the vertical rules drawn on every tariff page
@@ -45,6 +53,7 @@ HEADING_RE = re.compile(r"^\d{2}\.\d{2}$")
 DELETED_RE = re.compile(r"^\[\d{2}\.\d{2}\]$")
 CH99_RE = re.compile(r"^99\d{2}$")
 RATE_RE = re.compile(r"^\d{1,3}(\.\d+)?$")
+SPECIFIC_RE = re.compile(r"^Rs\. \d+(/(MT|Kg|set)| per meter)$")   # after _specific_text()
 SUBCHAPTER_RE = re.compile(r"^[IVX]+\s*[.\-]")       # "II.- INORGANIC ACIDS ..."
 LEADER_RE = re.compile(r"^[\s\-–—]+")
 
@@ -201,19 +210,29 @@ def parse(pdf_path: Path = PDF_PATH) -> Tuple[List[dict], List[dict], List[str]]
     return rows, skipped, notes
 
 
+def _specific_text(printed: str) -> str:
+    """'Rs. 105 50/ MT' -> 'Rs. 10550/MT'. Drops the cell's wrap breaks, keeps every character."""
+    s = re.sub(r"\s+", "", printed)
+    s = re.sub(r"^Rs\.", "Rs. ", s)
+    return re.sub(r"(\d)per", r"\1 per ", s)
+
+
 def _tariff_line(pno, code, desc, rate, raw, heading, heading_text, stack):
     """Build one CSV row, or return the reason it cannot be trusted."""
-    rate = rate.replace(" ", "")
-    if not rate:
+    if not rate.strip():
         return "no CD rate printed"
-    if not RATE_RE.match(rate):
-        return f"CD is not an ad valorem percentage ({rate})"
+    if RATE_RE.match(rate.replace(" ", "")):
+        duty = {"cd_rate": rate.replace(" ", ""), "duty_type": AD_VALOREM, "specific_duty_text": ""}
+    elif SPECIFIC_RE.match(_specific_text(rate)):
+        duty = {"cd_rate": "", "duty_type": SPECIFIC, "specific_duty_text": _specific_text(rate)}
+    else:
+        return f"CD is neither a percentage nor a recognised specific duty ({rate})"
     own = _clean(desc)
     if not own:
         return "no description printed"
 
     code_heading = f"{code[:2]}.{code[2:4]}"
-    rec = {"pct_code": code, "cd_rate": rate, "chapter": code[:2], "heading": code_heading}
+    rec = {"pct_code": code, "chapter": code[:2], "heading": code_heading, **duty}
 
     if code_heading != heading:
         # A heading with a single tariff line prints as one row: "0205.0000 Meat of horses".
@@ -240,9 +259,11 @@ def build(pdf_path: Path = PDF_PATH, csv_path: Path = CSV_PATH,
         w.writerows(rows)
 
     chapters = sorted({r["chapter"] for r in rows})
+    specific = [r for r in rows if r["duty_type"] == SPECIFIC]
     lines = [
         f"Parse report for {pdf_path.name}",
-        f"rows parsed:  {len(rows)}",
+        f"rows parsed:  {len(rows)}  ({len(rows) - len(specific)} ad valorem, "
+        f"{len(specific)} specific)",
         f"rows skipped: {len(skipped)}",
         f"chapters covered: {len(chapters)} ({', '.join(chapters)})",
         "",
@@ -253,11 +274,14 @@ def build(pdf_path: Path = PDF_PATH, csv_path: Path = CSV_PATH,
     for s in skipped:
         lines.append(f"page {s['page']:>3}  {s['pct_code'] or '-':<10}  {s['reason']}")
         lines.append(f"          raw: {s['raw']}")
+    lines += ["", "== SPECIFIC DUTIES (in pct_codes.csv, cd_rate empty) =="]
+    lines += [f"{r['pct_code']:<10}  {r['specific_duty_text']}" for r in specific]
     lines += ["", "== NOTES =="] + notes
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     load.cache_clear()
     _index.cache_clear()
-    return {"parsed": len(rows), "skipped": len(skipped), "chapters": chapters}
+    return {"parsed": len(rows), "specific": len(specific), "skipped": len(skipped),
+            "chapters": chapters}
 
 
 # ---------------------------------------------------------------- lookup and search
@@ -285,13 +309,24 @@ def lookup(pct_code: str) -> dict:
 
     cd_rate is a percentage string as printed ("20" means 20%). Use cd_fraction() before
     handing it to duty.compute, which expects 0.20.
+
+    duty_type is "ad_valorem" or "specific". A specific row has an empty cd_rate and the fixed
+    rupee duty in specific_duty_text ("Rs. 9050/MT"); the app has to ask for that amount.
     """
     row = _index().get(normalise(pct_code))
     return dict(row) if row else {}
 
 
+class SpecificDutyError(ValueError):
+    """The code carries a fixed rupee duty, so there is no percentage to compute with."""
+
+
 def cd_fraction(row: dict) -> Decimal:
-    """'20' -> Decimal('0.20'), for duty.compute."""
+    """'20' -> Decimal('0.20'), for duty.compute. Raises SpecificDutyError on a specific row."""
+    if row.get("duty_type") == SPECIFIC:
+        raise SpecificDutyError(
+            f"{row['pct_code']} carries a fixed rupee duty ({row['specific_duty_text']}), "
+            "not a percentage — enter the duty amount manually")
     return Decimal(row["cd_rate"]) / Decimal(100)
 
 
@@ -322,6 +357,6 @@ def search(text: str, limit: int = 20) -> List[dict]:
 
 if __name__ == "__main__":
     result = build()
-    print(f"rows parsed:      {result['parsed']}")
+    print(f"rows parsed:      {result['parsed']}  ({result['specific']} with a specific duty)")
     print(f"rows skipped:     {result['skipped']}  (see {REPORT_PATH.relative_to(ROOT)})")
     print(f"chapters covered: {len(result['chapters'])}")
