@@ -49,7 +49,7 @@ covered by tests. No language model is asked to compute money anywhere in this p
 
 ```bash
 pip install -r requirements.txt
-python run_tests.py          # no API key needed — currently 26/26
+python run_tests.py          # no API key needed — currently 30/30
 python -m core.tariff        # rebuild data/tariff/pct_codes.csv from the FBR PDF
 streamlit run app.py         # once the UI lands
 ```
