@@ -49,7 +49,8 @@ covered by tests. No language model is asked to compute money anywhere in this p
 
 ```bash
 pip install -r requirements.txt
-python run_tests.py          # no API key needed — currently 10/10
+python run_tests.py          # no API key needed — currently 26/26
+python -m core.tariff        # rebuild data/tariff/pct_codes.csv from the FBR PDF
 streamlit run app.py         # once the UI lands
 ```
 
@@ -58,6 +59,7 @@ streamlit run app.py         # once the UI lands
 ```
 core/schemas.py   FROZEN data contract — everything is written against this
 core/duty.py      the cascade; Decimal only, unit-tested
+core/tariff.py    tariff PDF → pct_codes.csv; lookup() and search()
 config/rates.json levy rates with their legal source and a verified flag
 tests/            the numbers the pitch claims
 data/tariff/      PCT codes and duty rates parsed from the FBR tariff (not hand-typed)
@@ -69,7 +71,7 @@ docs/             PRD
 
 - [x] Data contract frozen
 - [x] Duty engine + tests
-- [ ] Tariff parser (FBR Pakistan Customs Tariff FY 2026-27 → CSV)
+- [x] Tariff parser (FBR Pakistan Customs Tariff FY 2026-27 → CSV)
 - [ ] Extraction agents and reconciler
 - [ ] Classification agent with tariff retrieval
 - [ ] Streamlit UI with both human gates
