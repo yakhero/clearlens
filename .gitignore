@@ -1,0 +1,21 @@
+# secrets — never commit these
+.env
+.env.*
+.streamlit/secrets.toml
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# working files
+data/cache/*.json
+!data/cache/.gitkeep
+data/consignments/*.pdf
+!data/consignments/.gitkeep
+# the FBR tariff is a public document and the parser's input — keep it in the repo
+!data/tariff/pakistan_customs_tariff_2026-27.pdf
+.DS_Store
