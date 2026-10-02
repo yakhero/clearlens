@@ -18,19 +18,22 @@ Pakistani import levies cascade: customs duty, additional customs duty and regul
 are charged on CIF; sales tax is charged on CIF plus those duties; withholding tax is charged
 on all of it. So a wrong tariff code does not cost you the rate difference — it compounds.
 
-On a CIF of Rs 10,000,000, a 3% duty code versus a 20% one:
+On a CIF of Rs 10,000,000 of garlic, two codes from the same heading in the FY 2026-27
+tariff — 0703.2000 *Garlic* at 0% and 0703.9000 *Leeks and other alliaceous vegetables* at
+10%:
 
-| | Correct (CD 3%) | Wrong (CD 20%) |
+| | Correct: 0703.2000 (CD 0%) | Wrong: 0703.9000 (CD 10%) |
 |---|---|---|
-| Customs duty | 300,000 | 2,000,000 |
-| Additional customs duty | 200,000 | 200,000 |
-| Sales tax (18%) | 1,890,000 | 2,196,000 |
-| Withholding tax (5.5%) | 681,450 | 791,780 |
-| **Total taxes** | **3,071,450** | **5,187,780** |
+| Customs duty | 0 | 1,000,000 |
+| Additional customs duty (2%) | 200,000 | 200,000 |
+| Sales tax (18%) | 1,836,000 | 2,016,000 |
+| Withholding tax (5.5%) | 661,980 | 726,880 |
+| **Total taxes** | **2,697,980** | **3,942,880** |
 
-A 17-point gap in the duty rate becomes a **21.16-point** gap in cost — Rs 2,116,330 on one
-container. That arithmetic is in `core/duty.py`, it uses `Decimal` throughout, and it is
-covered by tests. No language model is asked to compute money anywhere in this project.
+One wrong digit in the code is a 10-point gap in the duty rate, and it becomes a
+**12.45-point** gap in cost — Rs 1,244,900 on one container. That arithmetic is in
+`core/duty.py`, it uses `Decimal` throughout, and it is covered by tests. No language model is
+asked to compute money anywhere in this project.
 
 ## Pipeline
 
@@ -49,9 +52,9 @@ covered by tests. No language model is asked to compute money anywhere in this p
 
 ```bash
 pip install -r requirements.txt
-python run_tests.py          # no API key needed — currently 30/30
+python run_tests.py          # no API key needed — currently 53/53
 python -m core.tariff        # rebuild data/tariff/pct_codes.csv from the FBR PDF
-streamlit run app.py         # once the UI lands
+streamlit run app.py         # runs on data/consignments/mock.json for now
 ```
 
 ## Layout
@@ -60,6 +63,8 @@ streamlit run app.py         # once the UI lands
 core/schemas.py   FROZEN data contract — everything is written against this
 core/duty.py      the cascade; Decimal only, unit-tested
 core/tariff.py    tariff PDF → pct_codes.csv; lookup() and search()
+core/reconcile.py match lines across the three documents, flag mismatches
+app.py            Streamlit UI: five steps, two human gates
 config/rates.json levy rates with their legal source and a verified flag
 tests/            the numbers the pitch claims
 data/tariff/      PCT codes and duty rates parsed from the FBR tariff (not hand-typed)
@@ -72,9 +77,10 @@ docs/             PRD
 - [x] Data contract frozen
 - [x] Duty engine + tests
 - [x] Tariff parser (FBR Pakistan Customs Tariff FY 2026-27 → CSV)
-- [ ] Extraction agents and reconciler
+- [ ] Extraction agents
+- [x] Reconciler
 - [ ] Classification agent with tariff retrieval
-- [ ] Streamlit UI with both human gates
+- [x] Streamlit UI with both human gates (mock data until the agents land)
 - [ ] Filing pack and Excel export
 
 ## Honest limits
