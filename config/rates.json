@@ -1,0 +1,36 @@
+{
+  "_note": "Every rate here must be checked against the current law before it appears in anything a customer sees. verified=false means nobody on the team has opened the legal source yet.",
+  "currency": "PKR",
+  "customs_duty": {
+    "source": "First Schedule to the Customs Act 1969 (Pakistan Customs Tariff FY 2026-27), per PCT code",
+    "note": "Rate is per eight-digit code and comes from the parsed tariff table, not from this file.",
+    "verified": false
+  },
+  "additional_customs_duty": {
+    "rate": "0.02",
+    "source": "SRO on additional customs duty — confirm current rate and any code-specific slabs",
+    "verified": false
+  },
+  "regulatory_duty": {
+    "default_rate": "0.00",
+    "source": "Regulatory duty SRO — applies only to listed PCT codes",
+    "verified": false
+  },
+  "sales_tax": {
+    "standard_rate": "0.18",
+    "source": "Sales Tax Act 1990, standard rate at import stage",
+    "note": "Reduced rates and exemptions exist per Eighth Schedule; not modelled yet.",
+    "verified": false
+  },
+  "withholding_income_tax": {
+    "rates_by_importer_status": {
+      "commercial_filer": "0.055",
+      "commercial_non_filer": "0.08",
+      "industrial_filer": "0.0550",
+      "industrial_non_filer": "0.08"
+    },
+    "source": "Section 148, Income Tax Ordinance 2001 — Part II of the First Schedule",
+    "note": "Rates differ by goods category and filer status. Placeholders until verified line by line.",
+    "verified": false
+  }
+}
