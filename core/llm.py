@@ -6,6 +6,8 @@
   application/json, and the reply is parsed with Decimal for every number — never float.
 * Model choice: GEMINI_MODEL if set, otherwise the newest stable Flash model the key can call
   (ListModels, filtered: no preview / exp / lite / thinking / tts / image / live variants).
+* Pacing: generate calls go out one at a time, at least MIN_INTERVAL_S apart (the free tier
+  allows 5 requests a minute), retries included, and on top of Google's own retry delay.
 * Retired models: a 404 that says the model is no longer available usually names the
   replacement ("... Please use gemini-2.5-flash instead"). We read that name out of the
   message and retry with it; if none is named, we fall back to ListModels. Bounded hops.
@@ -21,6 +23,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -32,6 +35,7 @@ TIMEOUT_S = 120
 MAX_MODEL_HOPS = 2              # replacement-model retries per call
 MAX_TRANSIENT_RETRIES = 2       # 429 / 500 / 503
 MAX_RETRY_WAIT_S = 60           # longest wait we accept from Google's "retry in Ns"
+MIN_INTERVAL_S = 13.0           # between generate requests: 5 per minute, with a margin
 _UNSTABLE = re.compile(r"preview|exp|experimental|lite|thinking|tts|image|live|audio|"
                        r"latest|native|embedding|8b", re.I)
 _FLASH = re.compile(r"^gemini-(\d+(?:\.\d+)?)-flash(?:-(\d{3}))?$")
@@ -43,6 +47,8 @@ _REPLACEMENT_HINT = re.compile(r"(?:use|switch(?:ing)? to|migrate to|replaced by
 
 _chosen_model: Optional[str] = None     # cached per process once a model has worked
 _reachable: Optional[bool] = None       # cached answer of available()
+_gate = threading.Lock()                # one generate request in flight per process
+_last_generate: Optional[float] = None  # time.monotonic() of the last generate request
 
 
 class LLMError(RuntimeError):
@@ -120,13 +126,21 @@ def _call(method: str, path: str, key: Optional[str],
     if key:                      # otherwise the environment injects x-goog-api-key
         headers["x-goog-api-key"] = key
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    paced = path.endswith(":generateContent")
     for attempt in range(MAX_TRANSIENT_RETRIES + 1):
-        status, data = _http(method, f"{API_ROOT}/{path}", headers, body, TIMEOUT_S)
+        if paced:
+            status, data = _paced_http(method, f"{API_ROOT}/{path}", headers, body)
+        else:
+            status, data = _http(method, f"{API_ROOT}/{path}", headers, body, TIMEOUT_S)
         if status < 400:
             return data
         message = _redact(str((data.get("error") or {}).get("message") or data), key)
         if status in (429, 500, 503) and attempt < MAX_TRANSIENT_RETRIES:
-            time.sleep(_retry_wait(data, message, attempt))
+            wait = _retry_wait(data, message, attempt)
+            if wait is None:                 # e.g. a daily quota: waiting a minute won't help
+                raise LLMError(f"Gemini API {status}: {_first_line(message)} — Google asks "
+                               "for a longer wait than this client will make; try later")
+            time.sleep(wait)
             continue
         if status == 404 and path.startswith("models/") and ":" in path:
             raise ModelUnavailable(path.split("/", 1)[1].split(":", 1)[0], message)
@@ -141,8 +155,30 @@ def _call(method: str, path: str, key: Optional[str],
     raise LLMError("Gemini API kept failing")      # pragma: no cover - loop always returns
 
 
-def _retry_wait(data: Dict[str, Any], message: str, attempt: int) -> float:
-    """Google's own retry hint (RetryInfo.retryDelay, or 'retry in 26.3s'), else 2s, 4s."""
+def _paced_http(method, url, headers, body) -> Tuple[int, Dict[str, Any]]:
+    """One generate request, never concurrent, never sooner than MIN_INTERVAL_S after the last."""
+    global _last_generate
+    with _gate:
+        if _last_generate is not None:
+            wait = _last_generate + MIN_INTERVAL_S - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        try:
+            return _http(method, url, headers, body, TIMEOUT_S)
+        finally:
+            _last_generate = time.monotonic()
+
+
+def _first_line(message: str) -> str:
+    return message.strip().splitlines()[0] if message.strip() else message
+
+
+def _retry_wait(data: Dict[str, Any], message: str, attempt: int) -> Optional[float]:
+    """Google's own retry hint (RetryInfo.retryDelay, or 'retry in 26.3s'), else 2s, 4s.
+
+    None when Google asks for longer than MAX_RETRY_WAIT_S ('retry in 9h26m58s'): retrying
+    sooner only spends more quota.
+    """
     hint = None
     for detail in (data.get("error") or {}).get("details") or []:
         delay = str(detail.get("retryDelay", "")) if isinstance(detail, dict) else ""
@@ -152,11 +188,16 @@ def _retry_wait(data: Dict[str, Any], message: str, attempt: int) -> float:
             except ValueError:
                 pass
     if hint is None:
-        found = re.search(r"retry in ([\d.]+)\s*s", message, re.I)
-        hint = float(found.group(1)) if found else None
+        found = re.search(r"retry in ((?:\d+h)?(?:\d+m)?[\d.]+s)", message, re.I)
+        if found:
+            parts = re.match(r"(?:(\d+)h)?(?:(\d+)m)?([\d.]+)s", found.group(1))
+            hint = (int(parts.group(1) or 0) * 3600 + int(parts.group(2) or 0) * 60
+                    + float(parts.group(3)))
     if hint is None:
         return 2.0 * (attempt + 1)
-    return min(hint + 1.0, MAX_RETRY_WAIT_S)
+    if hint > MAX_RETRY_WAIT_S:
+        return None
+    return hint + 1.0
 
 
 def _redact(text: str, key: str) -> str:

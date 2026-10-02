@@ -9,15 +9,27 @@ must copy its quote from it. verify_citations() then confirms, in code, that the
 the page it cites. If the quote sits within two pages of the citation the page is corrected;
 anywhere else, or nowhere, and the line is flagged verified=False. LineItem.verified is set
 here and only here — never by a model.
+
+One page per call: each page is its own small request (they are shed less under load), and the
+lines are merged in code. The model's answers are cached as JSON in data/consignments/cache/,
+keyed by the PDF's SHA-256 and the document type, so a document is only ever sent once and the
+demo runs with the API unavailable. The cache holds the model's raw answer; the citation check
+runs again on every load, so a cached answer is checked exactly like a fresh one. A cache file
+is written only when every page of the document succeeded.
 """
+import hashlib
+import json
 import re
+import time
 import unicodedata
 from dataclasses import replace
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from core import llm
 from core.schemas import DOC_TYPES, LineItem, coerce_line_item
 
+CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "consignments" / "cache"
 PAGE_WINDOW = 2          # a quote this many pages from its citation is corrected, not flagged
 MIN_QUOTE_CHARS = 8      # shorter quotes prove nothing ("1,200" is on many pages)
 
@@ -86,9 +98,10 @@ def page_texts(pdf_bytes: bytes) -> List[str]:
         return [page.get_text("text", sort=True) for page in doc]
 
 
-def _prompt(doc_type: str, pages: Sequence[str]) -> str:
-    body = "\n".join(f"=== PAGE {n} ===\n{text.strip()}" for n, text in enumerate(pages, 1))
-    return f"{AGENTS[doc_type]}\n\nThe document's text, page by page:\n\n{body}"
+def _prompt(doc_type: str, page_no: int, text: str, total: int) -> str:
+    return (f"{AGENTS[doc_type]}\n\nThis request carries page {page_no} of {total} only. "
+            "Return the product lines printed on this page, or an empty list if there are "
+            f"none.\n\n=== PAGE {page_no} ===\n{text.strip()}")
 
 
 # ---------------------------------------------------------------- citation check (code only)
@@ -137,30 +150,109 @@ def verify_citations(items: Sequence[LineItem], pages: Sequence[str]) -> List[Li
     return out
 
 
+# ---------------------------------------------------------------- cache
+_DEFAULT = "default"     # resolved to CACHE_DIR at call time, so tests can repoint it
+
+
+def _dir(cache_dir) -> Optional[Path]:
+    return CACHE_DIR if cache_dir == _DEFAULT else cache_dir
+
+
+def cache_path(doc_type: str, pdf_bytes: bytes, cache_dir=_DEFAULT) -> Path:
+    return _dir(cache_dir) / f"{hashlib.sha256(pdf_bytes).hexdigest()}.{doc_type}.json"
+
+
+def cached(doc_type: str, pdf_bytes: bytes, cache_dir=_DEFAULT) -> bool:
+    return _dir(cache_dir) is not None and cache_path(doc_type, pdf_bytes, cache_dir).exists()
+
+
+def _read_cache(path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data.get("lines"), list) else None
+
+
+def _write_cache(path: Path, doc_type: str, pdf_bytes: bytes, model: str, pages: int,
+                 lines: list) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"doc_type": doc_type, "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+              "model": model, "pages": pages,
+              "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "note": "Raw model output. Citations are re-verified in code on every load.",
+              "lines": lines}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
 # ---------------------------------------------------------------- agents
-def extract(doc_type: str, pdf_bytes: bytes,
-            model: Optional[str] = None) -> Tuple[List[LineItem], str]:
-    """Run one agent on one PDF. Returns (verified LineItems, model used)."""
+def _ask(doc_type: str, pages: Sequence[str], pdf_bytes: bytes,
+         model: Optional[str]) -> Tuple[list, str]:
+    """The model's raw lines for one document: one call per page with text, merged in code."""
+    if not any(p.strip() for p in pages):          # no text layer: one call with the PDF itself
+        prompt = (AGENTS[doc_type] + "\n\nThe document is attached (it has no text layer); "
+                  "'page' is the PDF page number.")
+        data, model = llm.generate_json(prompt, RESPONSE_SCHEMA, system=SYSTEM, model=model,
+                                        pdf_bytes=pdf_bytes)
+        return (data.get("lines", []) if isinstance(data, dict) else []), model
+    merged, seen = [], set()
+    for page_no, text in enumerate(pages, 1):
+        if not text.strip():
+            continue
+        data, model = llm.generate_json(_prompt(doc_type, page_no, text, len(pages)),
+                                        RESPONSE_SCHEMA, system=SYSTEM, model=model)
+        for raw in (data.get("lines", []) if isinstance(data, dict) else []):
+            if not isinstance(raw, dict):
+                continue
+            raw = dict(raw)
+            if not raw.get("page"):
+                raw["page"] = page_no
+            key = normalise(raw.get("quote", "")) or None
+            if key and key in seen:                 # the same row returned twice
+                continue
+            seen.add(key)
+            merged.append(raw)
+    for n, raw in enumerate(merged, 1):            # one numbering across the document
+        raw["line_no"] = n
+    return merged, model or ""
+
+
+def extract(doc_type: str, pdf_bytes: bytes, model: Optional[str] = None,
+            cache_dir=_DEFAULT) -> Tuple[List[LineItem], str]:
+    """Run one agent on one PDF. Returns (verified LineItems, model used).
+
+    A cached answer for this exact file is used without calling the API. cache_dir=None
+    disables the cache.
+    """
     if doc_type not in DOC_TYPES:
         raise ValueError(f"unknown document type {doc_type!r}")
     pages = page_texts(pdf_bytes)
-    has_text = any(p.strip() for p in pages)
-    prompt = _prompt(doc_type, pages) if has_text else (
-        AGENTS[doc_type] + "\n\nThe document is attached (it has no text layer); 'page' is the "
-                           "PDF page number.")
-    data, used = llm.generate_json(prompt, RESPONSE_SCHEMA, system=SYSTEM, model=model,
-                                   pdf_bytes=None if has_text else pdf_bytes)
-    raw_lines = data.get("lines", []) if isinstance(data, dict) else []
+    path = cache_path(doc_type, pdf_bytes, cache_dir) if _dir(cache_dir) else None
+    record = _read_cache(path) if path and path.exists() else None
+    if record:
+        raw_lines, used = record["lines"], record.get("model", "")
+    else:
+        raw_lines, used = _ask(doc_type, pages, pdf_bytes, model)
+        if path:
+            _write_cache(path, doc_type, pdf_bytes, used, len(pages), raw_lines)
     items = [coerce_line_item(raw, doc_type, i) for i, raw in enumerate(raw_lines, 1)]
     return verify_citations([it for it in items if it], pages), used
 
 
-def extract_all(pdfs: dict, model: Optional[str] = None) -> Tuple[List[LineItem], str]:
-    """{'invoice': bytes, 'packing_list': bytes, 'bill_of_lading': bytes} -> all lines."""
+def extract_all(pdfs: dict, model: Optional[str] = None,
+                cache_dir=_DEFAULT) -> Tuple[List[LineItem], str]:
+    """{'invoice': bytes, 'packing_list': bytes, 'bill_of_lading': bytes} -> all lines.
+
+    One document at a time, one page at a time; llm paces the calls.
+    """
     lines: List[LineItem] = []
     used = ""
     for doc_type in DOC_TYPES:
         if pdfs.get(doc_type):
-            items, used = extract(doc_type, pdfs[doc_type], model=model or (used or None))
+            items, got = extract(doc_type, pdfs[doc_type], model=model or (used or None),
+                                 cache_dir=cache_dir)
+            used = used or got
             lines += items
     return lines, used

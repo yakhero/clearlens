@@ -51,6 +51,7 @@ class FakeAPI:
 def run(fake, fn, env=None):
     saved_http, saved_env = llm._http, dict(os.environ)
     llm._http, llm._chosen_model, llm._reachable = fake, None, None
+    saved_interval, llm.MIN_INTERVAL_S, llm._last_generate = llm.MIN_INTERVAL_S, 0.0, None
     os.environ.pop("GEMINI_MODEL", None)
     os.environ["GEMINI_API_KEY"] = KEY
     os.environ.update(env or {})
@@ -58,6 +59,7 @@ def run(fake, fn, env=None):
         return fn()
     finally:
         llm._http, llm._chosen_model, llm._reachable = saved_http, None, None
+        llm.MIN_INTERVAL_S, llm._last_generate = saved_interval, None
         os.environ.clear()
         os.environ.update(saved_env)
 
@@ -280,7 +282,10 @@ def test_rate_limit_waits_as_long_as_google_asks():
     assert llm._retry_wait(quota, quota["error"]["message"], 0) == 27.0
     assert llm._retry_wait({}, "Please retry in 12.5s.", 0) == 13.5
     assert llm._retry_wait({}, "overloaded", 1) == 4.0
-    assert llm._retry_wait({}, "Please retry in 900s.", 0) == llm.MAX_RETRY_WAIT_S
+    assert llm._retry_wait({}, "Please retry in 900s.", 0) is None
+    assert llm._retry_wait({}, "Please retry in 9h26m58.079s.", 0) is None
+    assert llm._retry_wait({}, "Please retry in 1m5.5s.", 0) is None
+    assert llm._retry_wait({}, "Please retry in 0m40s.", 0) == 41.0
 
     answers = iter([(429, quota), (200, reply('{"n": 2}'))])
     saved = llm.time.sleep
@@ -291,3 +296,65 @@ def test_rate_limit_waits_as_long_as_google_asks():
     finally:
         llm.time.sleep = saved
     assert data == {"n": 2} and waits == [27.0]
+
+
+
+def test_generate_calls_are_spaced_and_never_concurrent():
+    clock = {"t": 1000.0}
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(round(seconds, 3))
+        clock["t"] += seconds
+    saved = (llm.time.sleep, llm.time.monotonic)
+    llm.time.sleep, llm.time.monotonic = sleep, lambda: clock["t"]
+
+    def three_calls():
+        llm.MIN_INTERVAL_S = 13.0
+        for _ in range(3):
+            llm.generate_json("hi", SCHEMA, model="gemini-2.5-flash")
+            clock["t"] += 2.0                       # the reply takes 2 s to handle
+    try:
+        run(FakeAPI(), three_calls)
+    finally:
+        llm.time.sleep, llm.time.monotonic = saved
+    assert sleeps == [11.0, 11.0]                   # 13 s after each previous request
+    assert llm._gate.acquire(blocking=False)        # the gate is released afterwards
+    llm._gate.release()
+
+
+def test_list_models_is_not_paced():
+    saved = llm.time.sleep
+    llm.time.sleep = lambda s: (_ for _ in ()).throw(AssertionError("slept"))
+    try:
+        def go():
+            llm.MIN_INTERVAL_S = 13.0
+            llm._last_generate = llm.time.monotonic()
+            return llm.list_models(None)
+        assert run(FakeAPI(), go)
+    finally:
+        llm.time.sleep = saved
+
+
+
+def test_daily_quota_fails_fast_instead_of_retrying():
+    daily = {"error": {"code": 429, "message": "You exceeded your current quota.\n* Quota "
+                       "exceeded for metric: generate_content_free_tier_requests, limit: 20\n"
+                       "Please retry in 9h26m58.079527938s."}}
+    fake_calls = []
+
+    def http(*a):
+        fake_calls.append(a)
+        return 429, daily
+    saved = llm.time.sleep
+    llm.time.sleep = lambda s: (_ for _ in ()).throw(AssertionError("must not wait"))
+    try:
+        run(http, lambda: llm.generate_json("hi", SCHEMA, model="gemini-2.5-flash"))
+    except llm.LLMError as err:
+        assert "429" in str(err) and "try later" in str(err)
+        assert "\n" not in str(err)
+        assert len(fake_calls) == 1                    # no retry burned on a daily quota
+        return
+    finally:
+        llm.time.sleep = saved
+    raise AssertionError

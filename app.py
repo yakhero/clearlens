@@ -98,19 +98,25 @@ def flagged_lines() -> list:
 
 
 def run_extraction(pdfs: dict, source: str, label: str):
-    """Three agents, the citation check, then the reconciler. Keeps current data on error."""
+    """Three agents one after another, the citation check, then the reconciler.
+
+    Documents already in the disk cache make no API call. Keeps current data on error.
+    """
     s = st.session_state
     current = s.consignment
     try:
-        with st.status("Extracting with Gemini…", expanded=True) as status:
+        with st.status("Extracting…", expanded=True) as status:
             lines, model = [], None
             for doc in DOC_TYPES:
-                st.write(f"Reading the {DOC_TITLES[doc].lower()}…")
-                items, model = extract.extract(doc, pdfs[doc], model=model)
+                from_cache = extract.cached(doc, pdfs[doc])
+                st.write(f"Reading the {DOC_TITLES[doc].lower()}"
+                         + (" from the cache…" if from_cache else " with Gemini, page by page…"))
+                items, got = extract.extract(doc, pdfs[doc], model=None if from_cache else model)
+                model = model or got
                 ok = sum(1 for i in items if i.verified)
                 st.write(f"{len(items)} line(s); {ok} quote(s) confirmed on their page.")
                 lines += items
-            status.update(label=f"Extracted with {model}", state="complete")
+            status.update(label=f"Extracted ({model})", state="complete")
     except llm.LLMError as err:
         st.error(f"Extraction stopped: {err}. The previous documents are still loaded.")
         return
@@ -135,30 +141,37 @@ def source_panel():
                 use_lines(c, meta, note, source="mock")
                 st.rerun()
             return
-        if not llm.available():
-            st.info("Gemini is not reachable with a key. Set the GEMINI_API_KEY environment "
-                    "variable, add GEMINI_API_KEY to .streamlit/secrets.toml, or configure it as "
-                    "an environment credential, and restart. The offline demo works without one.")
-        else:
-            st.caption(f"Gemini key: found in {llm.key_source()}.")
         if choice == "demo_pdfs":
             st.caption("data/consignments/demo_invoice.pdf, demo_packing_list.pdf and "
                        "demo_bill_of_lading.pdf — fictional, generated from mock.json by "
                        "core/demo_docs.py, with the same two planted mismatches.")
-            if st.button("Extract the demo PDFs", type="primary",
-                         disabled=not llm.available()):
-                run_extraction(demo_docs.load_demo_pdfs(), "demo_pdfs",
-                               "the generated demo PDFs")
-            return
-        cols = st.columns(3)
-        files = {doc: cols[i].file_uploader(DOC_TITLES[doc], type=["pdf"], key=f"up_{doc}")
-                 for i, doc in enumerate(DOC_TYPES)}
-        ready = all(files.values())
-        if st.button("Extract the uploaded PDFs", type="primary",
-                     disabled=not (ready and llm.available())):
-            run_extraction({d: f.getvalue() for d, f in files.items()}, "upload",
-                           "the uploaded PDFs (" + ", ".join(f.name for f in files.values())
-                           + ")")
+            pdfs, label = demo_docs.load_demo_pdfs(), "the generated demo PDFs"
+        else:
+            cols = st.columns(3)
+            files = {doc: cols[i].file_uploader(DOC_TITLES[doc], type=["pdf"], key=f"up_{doc}")
+                     for i, doc in enumerate(DOC_TYPES)}
+            pdfs = {d: f.getvalue() for d, f in files.items() if f}
+            label = ("the uploaded PDFs ("
+                     + ", ".join(f.name for f in files.values() if f) + ")")
+        ready = len(pdfs) == len(DOC_TYPES)
+        # A document extracted before is read from the disk cache: no API call, no key needed.
+        all_cached = ready and all(extract.cached(d, b) for d, b in pdfs.items())
+        if all_cached:
+            st.caption("All three documents were extracted before: their cached answers will "
+                       "be used, with no call to the API. Citations are checked again.")
+            can_run = True
+        elif llm.available():
+            st.caption(f"Gemini key: found in {llm.key_source()}. Calls go out one page at a "
+                       f"time, at least {llm.MIN_INTERVAL_S:.0f} s apart.")
+            can_run = ready
+        else:
+            st.info("Gemini is not reachable with a key. Set the GEMINI_API_KEY environment "
+                    "variable, add GEMINI_API_KEY to .streamlit/secrets.toml, or configure it as "
+                    "an environment credential, and restart. The offline demo works without one.")
+            can_run = False
+        button = "Extract the demo PDFs" if choice == "demo_pdfs" else "Extract the uploaded PDFs"
+        if st.button(button, type="primary", disabled=not can_run):
+            run_extraction(pdfs, choice, label)
 
 
 def consignment_panel(c: Consignment):

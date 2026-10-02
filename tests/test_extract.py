@@ -1,6 +1,7 @@
 """Tests for the citation verifier and the extraction agents. No network, no API key: the
 model is replaced by a stand-in, and the verifier is pure code."""
 import sys
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 
@@ -135,7 +136,10 @@ def fake_model(answers):
     def generate_json(prompt, schema, **kw):
         calls.append({"prompt": prompt, "schema": schema, **kw})
         doc = next(d for d, intro in extract.AGENTS.items() if prompt.startswith(intro))
-        return {"lines": answers[doc]}, "gemini-test-flash"
+        page = int(prompt.split("=== PAGE ", 1)[1].split(" ", 1)[0])
+        # one page per request: answer with the lines the model places on that page
+        return {"lines": [r for r in answers[doc] if str(r.get("page")) == str(page)]}, \
+            "gemini-test-flash"
     return generate_json, calls
 
 
@@ -184,19 +188,23 @@ ANSWERS = {
 }
 
 
-def with_fake(answers, fn):
-    real = llm.generate_json
+def with_fake(answers, fn, cache_dir=None):
+    """Stand-in model, and a throwaway cache so fake answers never reach the real one."""
+    real, real_dir = llm.generate_json, extract.CACHE_DIR
     gen, calls = fake_model(answers)
     llm.generate_json = gen
-    try:
-        return fn(), calls
-    finally:
-        llm.generate_json = real
+    with tempfile.TemporaryDirectory() as tmp:
+        extract.CACHE_DIR = Path(cache_dir or tmp)
+        try:
+            return fn(), calls
+        finally:
+            llm.generate_json, extract.CACHE_DIR = real, real_dir
 
 
 def test_pipeline_from_pdfs_to_reconciler_finds_the_planted_mismatches():
     (lines, model), calls = with_fake(ANSWERS, lambda: extract.extract_all(PDFS))
-    assert model == "gemini-test-flash" and len(calls) == 3
+    assert model == "gemini-test-flash"
+    assert len(calls) == 4                    # one per page with text: 1 + 1 + 2 (B/L terms)
     assert all(l.verified for l in lines), [l.verify_note for l in lines if not l.verified]
     by_doc = {d: [l for l in lines if l.source_doc == d] for d in extract.AGENTS}
     _, ds = reconcile.reconcile(by_doc["invoice"], by_doc["packing_list"],
@@ -244,3 +252,89 @@ def test_unknown_document_type_is_refused():
     except ValueError:
         return
     raise AssertionError("an unknown document type must be refused")
+
+
+# ---------------------------------------------------------------- one page per call, merged in code
+def test_each_call_carries_exactly_one_page():
+    _, calls = with_fake(ANSWERS, lambda: extract.extract("bill_of_lading",
+                                                         PDFS["bill_of_lading"]))
+    assert len(calls) == 2
+    for n, call in enumerate(calls, 1):
+        assert call["prompt"].count("=== PAGE") == 1 and f"=== PAGE {n} ===" in call["prompt"]
+    assert "TERMS AND CONDITIONS" in calls[1]["prompt"]
+    assert "TERMS AND CONDITIONS" not in calls[0]["prompt"]
+
+
+def test_lines_from_several_pages_are_merged_and_renumbered():
+    pages = ["1 Fresh garlic normal white 1,200 BAGS", "2 Garlic flakes dehydrated 150 CTNS",
+             "terms"]
+    answers = [[{"line_no": 1, "page": 1, "description": "Fresh garlic",
+                 "quote": "1 Fresh garlic normal white 1,200 BAGS"}],
+               [{"line_no": 1, "page": 2, "description": "Garlic flakes",
+                 "quote": "2 Garlic flakes dehydrated 150 CTNS"},
+                {"line_no": 2, "page": 2, "description": "Fresh garlic (repeated)",
+                 "quote": "1 Fresh garlic normal white 1,200 BAGS"}],
+               []]
+    real = llm.generate_json
+    replies = iter(answers)
+    llm.generate_json = lambda *a, **k: ({"lines": next(replies)}, "m")
+    try:
+        merged, model = extract._ask("invoice", pages, b"", None)
+    finally:
+        llm.generate_json = real
+    assert [r["line_no"] for r in merged] == [1, 2]                  # duplicate dropped
+    assert [r["description"] for r in merged] == ["Fresh garlic", "Garlic flakes"]
+    assert model == "m"
+
+
+# ---------------------------------------------------------------- the disk cache
+def test_second_extraction_of_the_same_file_uses_the_cache_not_the_api():
+    with tempfile.TemporaryDirectory() as tmp:
+        (first, _), calls = with_fake(ANSWERS, lambda: extract.extract(
+            "invoice", PDFS["invoice"]), cache_dir=tmp)
+        assert len(calls) == 1
+        path = extract.cache_path("invoice", PDFS["invoice"], Path(tmp))
+        assert path.exists() and path.name.endswith(".invoice.json")
+        (second, model), calls = with_fake({}, lambda: extract.extract(
+            "invoice", PDFS["invoice"]), cache_dir=tmp)
+        assert calls == [] and model == "gemini-test-flash"
+        assert second == first
+
+
+def test_cache_is_keyed_by_content_and_document_type():
+    with tempfile.TemporaryDirectory() as tmp:
+        a = extract.cache_path("invoice", PDFS["invoice"], Path(tmp))
+        assert a != extract.cache_path("packing_list", PDFS["invoice"], Path(tmp))
+        assert a != extract.cache_path("invoice", PDFS["invoice"] + b" ", Path(tmp))
+        import hashlib
+        assert a.name.startswith(hashlib.sha256(PDFS["invoice"]).hexdigest())
+
+
+def test_a_failed_extraction_writes_no_cache():
+    def boom(*a, **k):
+        raise llm.LLMError("Gemini API 503: high demand")
+    real, real_dir = llm.generate_json, extract.CACHE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        llm.generate_json, extract.CACHE_DIR = boom, Path(tmp)
+        try:
+            extract.extract("bill_of_lading", PDFS["bill_of_lading"])
+        except llm.LLMError:
+            pass
+        finally:
+            llm.generate_json, extract.CACHE_DIR = real, real_dir
+        assert list(Path(tmp).iterdir()) == []
+
+
+def test_cached_answers_are_still_citation_checked():
+    """A cache file edited by hand gets no free pass."""
+    import json as _json
+    with tempfile.TemporaryDirectory() as tmp:
+        with_fake(ANSWERS, lambda: extract.extract("invoice", PDFS["invoice"]), cache_dir=tmp)
+        path = extract.cache_path("invoice", PDFS["invoice"], Path(tmp))
+        record = _json.loads(path.read_text())
+        record["lines"][0]["quote"] = "1 Fresh Garlic, Normal White 1,000 BAGS 9.00 9,000.00"
+        record["lines"][0]["quantity"] = "1,000"
+        path.write_text(_json.dumps(record))
+        (items, _), calls = with_fake({}, lambda: extract.extract(
+            "invoice", PDFS["invoice"]), cache_dir=tmp)
+        assert calls == [] and items[0].verified is False and items[1].verified
