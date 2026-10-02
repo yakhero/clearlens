@@ -52,9 +52,10 @@ asked to compute money anywhere in this project.
 
 ```bash
 pip install -r requirements.txt
-python run_tests.py          # no API key needed — currently 53/53
+python run_tests.py          # no API key needed — currently 90/90
 python -m core.tariff        # rebuild data/tariff/pct_codes.csv from the FBR PDF
-streamlit run app.py         # runs on data/consignments/mock.json for now
+export GEMINI_API_KEY=...     # or put it in .streamlit/secrets.toml (git-ignored)
+streamlit run app.py         # without a key, the offline demo (mock.json) still runs
 ```
 
 ## Layout
@@ -64,6 +65,9 @@ core/schemas.py   FROZEN data contract — everything is written against this
 core/duty.py      the cascade; Decimal only, unit-tested
 core/tariff.py    tariff PDF → pct_codes.csv; lookup() and search()
 core/reconcile.py match lines across the three documents, flag mismatches
+core/llm.py       Gemini client, standard library only, structured JSON output
+core/extract.py   three extraction agents + the citation check (code, not model)
+core/demo_docs.py renders mock.json as the three demo PDFs
 app.py            Streamlit UI: five steps, two human gates
 config/rates.json levy rates with their legal source and a verified flag
 tests/            the numbers the pitch claims
@@ -77,10 +81,10 @@ docs/             PRD
 - [x] Data contract frozen
 - [x] Duty engine + tests
 - [x] Tariff parser (FBR Pakistan Customs Tariff FY 2026-27 → CSV)
-- [ ] Extraction agents
+- [x] Extraction agents with a code-side citation check (needs GEMINI_API_KEY)
 - [x] Reconciler
 - [ ] Classification agent with tariff retrieval
-- [x] Streamlit UI with both human gates (mock data until the agents land)
+- [x] Streamlit UI with both human gates (upload, demo PDFs, or offline mock data)
 - [ ] Filing pack and Excel export
 
 ## Honest limits

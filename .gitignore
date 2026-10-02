@@ -16,6 +16,8 @@ data/cache/*.json
 !data/cache/.gitkeep
 data/consignments/*.pdf
 !data/consignments/.gitkeep
+# generated from mock.json by core/demo_docs.py — fictional, kept so the demo runs offline
+!data/consignments/demo_*.pdf
 # the FBR tariff is a public document and the parser's input — keep it in the repo
 !data/tariff/pakistan_customs_tariff_2026-27.pdf
 .DS_Store

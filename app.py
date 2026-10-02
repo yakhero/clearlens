@@ -1,6 +1,9 @@
-"""ClearLens — Streamlit UI. Runs on mock data until the extraction agents land.
+"""ClearLens — Streamlit UI.
 
     streamlit run app.py
+
+Documents come from three PDFs (uploaded, or the generated demo set) read by the extraction
+agents in core/extract.py, or — offline, with no API key — from data/consignments/mock.json.
 
 Five steps, two human gates. Nothing here computes money: the cascade comes from core/duty.py,
 rates come from the parsed tariff, and every choice that matters is made by the person at a
@@ -13,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core import duty, reconcile, tariff
+from core import demo_docs, duty, extract, llm, reconcile, tariff
 from core.schemas import (D, DOC_TYPES, IMPORTER_STATUSES, Classification, Consignment,
                           coerce_line_item)
 
@@ -29,6 +32,9 @@ COLUMNS = {"quantity": "Qty", "unit": "Unit", "unit_price": "Unit price", "curre
            "origin": "Origin"}
 SEVERITY_STYLE = {"blocking": "background-color: rgba(220, 38, 38, 0.28); font-weight: 600",
                   "advisory": "background-color: rgba(217, 119, 6, 0.25)"}
+SOURCES = {"mock": "Offline demo — mock.json (no API key needed)",
+           "demo_pdfs": "Generated demo PDFs — extract with Gemini",
+           "upload": "Upload three PDFs — extract with Gemini"}
 SEARCH_STOPWORDS = {"size", "packed", "pack", "packing", "bags", "bag", "mesh", "grade",
                     "cartons", "carton", "with", "from", "into", "each", "kgs"}
 
@@ -65,35 +71,139 @@ def start(reset: bool = False):
         for k in list(s.keys()):
             del s[k]
         c, meta, note = load_consignment()
-        docs = docs_of(c)
-        matched, discrepancies = reconcile.reconcile(docs["invoice"], docs["packing_list"],
-                                                     docs["bill_of_lading"])
-        c.discrepancies = discrepancies
-        s.consignment, s.meta, s.note, s.matched = c, meta, note, matched
-        s.gate1_closed = False
-        s.gate2 = {}            # line_no -> Classification, only once a person confirms it
         s.step = STEPS[0]
+        use_lines(c, meta, note, source="mock")
+
+
+def use_lines(c: Consignment, meta: dict, note: str, source: str, model: str = ""):
+    """Put a consignment in front of the reconciler and reset both gates."""
+    s = st.session_state
+    docs = docs_of(c)
+    matched, discrepancies = reconcile.reconcile(docs["invoice"], docs["packing_list"],
+                                                 docs["bill_of_lading"])
+    c.discrepancies = discrepancies
+    s.consignment, s.meta, s.note, s.matched = c, meta, note, matched
+    s.source, s.model = source, model
+    s.gate1_closed = False
+    s.gate2 = {}                # line_no -> Classification, only once a person confirms it
+    s.citations_checked = set()  # flagged extracted lines a person has checked against the PDF
+
+
+def flagged_lines() -> list:
+    """Extracted lines whose quote the citation check could not find. Mock lines have no PDF."""
+    s = st.session_state
+    if s.source == "mock":
+        return []
+    return [l for l in s.consignment.lines if not l.verified]
+
+
+def run_extraction(pdfs: dict, source: str, label: str):
+    """Three agents, the citation check, then the reconciler. Keeps current data on error."""
+    s = st.session_state
+    current = s.consignment
+    try:
+        with st.status("Extracting with Gemini…", expanded=True) as status:
+            lines, model = [], None
+            for doc in DOC_TYPES:
+                st.write(f"Reading the {DOC_TITLES[doc].lower()}…")
+                items, model = extract.extract(doc, pdfs[doc], model=model)
+                ok = sum(1 for i in items if i.verified)
+                st.write(f"{len(items)} line(s); {ok} quote(s) confirmed on their page.")
+                lines += items
+            status.update(label=f"Extracted with {model}", state="complete")
+    except llm.LLMError as err:
+        st.error(f"Extraction stopped: {err}. The previous documents are still loaded.")
+        return
+    c = Consignment(reference=current.reference, importer_status=current.importer_status,
+                    fx_rate=current.fx_rate, freight=current.freight,
+                    insurance=current.insurance, lines=lines)
+    note = (f"Extracted from {label} by {model}. Every quote was checked against its page in "
+            "code; any flagged line must be checked by a person at gate 1.")
+    use_lines(c, s.meta if source == "demo_pdfs" else {}, note, source=source, model=model)
+    st.rerun()
 
 
 # ---------------------------------------------------------------- steps
+def source_panel():
+    s = st.session_state
+    with st.container(border=True):
+        choice = st.radio("Where do the documents come from?", list(SOURCES),
+                          format_func=SOURCES.get, key="source_choice")
+        if choice == "mock":
+            if s.source != "mock" and st.button("Load the offline demo"):
+                c, meta, note = load_consignment()
+                use_lines(c, meta, note, source="mock")
+                st.rerun()
+            return
+        if not llm.available():
+            st.info("No Gemini API key found. Set the GEMINI_API_KEY environment variable, or "
+                    "add GEMINI_API_KEY to .streamlit/secrets.toml, and restart. The offline "
+                    "demo works without one.")
+        else:
+            st.caption(f"Gemini key: found in {llm.key_source()}.")
+        if choice == "demo_pdfs":
+            st.caption("data/consignments/demo_invoice.pdf, demo_packing_list.pdf and "
+                       "demo_bill_of_lading.pdf — fictional, generated from mock.json by "
+                       "core/demo_docs.py, with the same two planted mismatches.")
+            if st.button("Extract the demo PDFs", type="primary",
+                         disabled=not llm.available()):
+                run_extraction(demo_docs.load_demo_pdfs(), "demo_pdfs",
+                               "the generated demo PDFs")
+            return
+        cols = st.columns(3)
+        files = {doc: cols[i].file_uploader(DOC_TITLES[doc], type=["pdf"], key=f"up_{doc}")
+                 for i, doc in enumerate(DOC_TYPES)}
+        ready = all(files.values())
+        if st.button("Extract the uploaded PDFs", type="primary",
+                     disabled=not (ready and llm.available())):
+            run_extraction({d: f.getvalue() for d, f in files.items()}, "upload",
+                           "the uploaded PDFs (" + ", ".join(f.name for f in files.values())
+                           + ")")
+
+
+def consignment_panel(c: Consignment):
+    """Header values the line items do not carry. Text in, Decimal out — never float."""
+    cols = st.columns(4)
+    c.reference = cols[0].text_input("Reference", c.reference, key="hdr_reference")
+    for col, attr, label in ((cols[1], "fx_rate", "FX rate (invoice currency → PKR)"),
+                             (cols[2], "freight", "Freight (invoice currency)"),
+                             (cols[3], "insurance", "Insurance (invoice currency)")):
+        typed = col.text_input(label, str(getattr(c, attr)), key=f"hdr_{attr}")
+        value = D(typed)
+        if attr == "fx_rate" and value <= 0:
+            col.error("Enter a positive FX rate.")
+        else:
+            setattr(c, attr, value)
+
+
+def citation_label(it) -> str:
+    if st.session_state.source == "mock":
+        return "mock data"
+    return "✓ " + it.verify_note if it.verified else "⚠ " + it.verify_note
+
+
 def step_documents():
     s = st.session_state
     c, meta = s.consignment, s.meta
     st.subheader("Documents")
-    st.caption("Mock data: these lines stand in for what the three extraction agents will read "
-               "from the PDFs. " + s.note)
-    cols = st.columns(4)
-    cols[0].metric("Reference", c.reference)
-    cols[1].metric("FX rate (USD → PKR)", fmt(c.fx_rate))
-    cols[2].metric("Freight (USD)", fmt(c.freight))
-    cols[3].metric("Insurance (USD)", fmt(c.insurance))
+    source_panel()
+    st.caption(s.note)
+    consignment_panel(c)
     if meta:
-        st.dataframe(pd.DataFrame({"": list(meta.keys()), "value": list(meta.values())}),
-                     hide_index=True)
+        with st.expander("Shipment details"):
+            st.dataframe(pd.DataFrame({"": list(meta.keys()), "value": list(meta.values())}),
+                         hide_index=True)
+    flagged = flagged_lines()
+    if flagged:
+        st.warning(f"{len(flagged)} extracted line(s) failed the citation check: the quote is "
+                   "not on the page the model cited, nor within two pages. Check them against "
+                   "the PDF — gate 1 will ask you to confirm each one.")
     for doc, items in docs_of(c).items():
         st.markdown(f"**{DOC_TITLES[doc]}** — {len(items)} lines")
         rows = [{"#": it.line_no, "Description": it.description,
-                 **{label: fmt(getattr(it, f)) for f, label in COLUMNS.items()}} for it in items]
+                 **{label: fmt(getattr(it, f)) for f, label in COLUMNS.items()},
+                 "Page": it.page, "Citation": citation_label(it), "Quote": it.quote}
+                for it in items]
         st.dataframe(pd.DataFrame(rows), hide_index=True)
 
 
@@ -148,7 +258,7 @@ def step_gate1():
     st.subheader("Human gate 1 — resolve each mismatch")
     st.caption("Pick the value that is right, or type the correct one. Blocking items must be "
                "settled before classification; advisory items may stay as the invoice has them.")
-    if not ds:
+    if not ds and not flagged_lines():
         st.success("Nothing to resolve.")
     for d in ds:
         n, name = reconcile.split_field(d.field_name)
@@ -181,11 +291,26 @@ def step_gate1():
             else:
                 d.resolved_value = list(by_value)[options.index(pick)]
 
+    unchecked = []
+    for it in flagged_lines():
+        with st.container(border=True):
+            st.markdown(f"**{DOC_TITLES[it.source_doc]}, line {it.line_no} — citation not "
+                        "found** · `blocking`")
+            st.caption(f"{it.verify_note}. Model's quote (page {it.page}): “{it.quote}”")
+            key = (it.source_doc, it.line_no)
+            if st.checkbox("I checked this line against the PDF and its values are right",
+                           key=f"g1_cite_{it.source_doc}_{it.line_no}"):
+                s.citations_checked.add(key)
+            else:
+                s.citations_checked.discard(key)
+                unchecked.append(it)
+
     left = reconcile.unresolved_blocking(ds)
-    if left:
+    if left or unchecked:
         s.gate1_closed = False          # reopening an item reopens the gate
-        st.info(f"{len(left)} blocking item(s) still open.")
-    if st.button("Confirm lines and close gate 1", type="primary", disabled=bool(left)):
+        st.info(f"{len(left) + len(unchecked)} blocking item(s) still open.")
+    if st.button("Confirm lines and close gate 1", type="primary",
+                 disabled=bool(left or unchecked)):
         s.gate1_closed = True
     if s.gate1_closed:
         dropped = dropped_lines()
@@ -362,13 +487,17 @@ def main():
         st.caption("The model reads and writes. Code computes and decides.")
         st.radio("Step", STEPS, key="step")
         st.divider()
-        open_blocking = len(reconcile.unresolved_blocking(s.consignment.discrepancies))
+        open_blocking = len(reconcile.unresolved_blocking(s.consignment.discrepancies)) + \
+            len([l for l in flagged_lines()
+                 if (l.source_doc, l.line_no) not in s.citations_checked])
         st.markdown(f"Gate 1: {'✅ closed' if s.gate1_closed else f'⏳ {open_blocking} blocking open'}")
         lines = confirmed_lines() if s.gate1_closed else []
         done = sum(1 for l in lines if l.line_no in s.gate2)
         st.markdown(f"Gate 2: {'✅ closed' if lines and done == len(lines) else f'⏳ {done}/{len(lines)} codes'}")
         st.divider()
-        if st.button("Reload mock consignment"):
+        st.caption(f"Source: {SOURCES[s.source].split(' — ')[0]}"
+                   + (f" · {s.model}" if s.model else ""))
+        if st.button("Reload offline demo"):
             start(reset=True)
             st.rerun()
         st.caption("Prepares and checks; does not file. Not customs advice.")
