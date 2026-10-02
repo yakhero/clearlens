@@ -9,8 +9,13 @@
 * Retired models: a 404 that says the model is no longer available usually names the
   replacement ("... Please use gemini-2.5-flash instead"). We read that name out of the
   message and retry with it; if none is named, we fall back to ListModels. Bounded hops.
-* The key: GEMINI_API_KEY from the environment, else st.secrets["GEMINI_API_KEY"]. It is sent
-  in the x-goog-api-key header — never in a URL, a log line, an error message or a widget.
+* The key, two ways:
+    - in code: GEMINI_API_KEY from the environment, else st.secrets["GEMINI_API_KEY"] (e.g.
+      Streamlit Cloud). Sent in the x-goog-api-key header — never in a URL, a log line, an
+      error message or a widget.
+    - not in code: the request goes out with no key header, and an environment that holds the
+      credential (a proxy injecting x-goog-api-key) adds it. If nothing adds it, Google answers
+      403 and we say so. available() asks ListModels once to find out which case we are in.
 """
 import base64
 import json
@@ -26,6 +31,7 @@ API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 TIMEOUT_S = 120
 MAX_MODEL_HOPS = 2              # replacement-model retries per call
 MAX_TRANSIENT_RETRIES = 2       # 429 / 500 / 503
+MAX_RETRY_WAIT_S = 60           # longest wait we accept from Google's "retry in Ns"
 _UNSTABLE = re.compile(r"preview|exp|experimental|lite|thinking|tts|image|live|audio|"
                        r"latest|native|embedding|8b", re.I)
 _FLASH = re.compile(r"^gemini-(\d+(?:\.\d+)?)-flash(?:-(\d{3}))?$")
@@ -36,6 +42,7 @@ _REPLACEMENT_HINT = re.compile(r"(?:use|switch(?:ing)? to|migrate to|replaced by
                                r"(?:models/)?(gemini-[a-z0-9][a-z0-9.\-]*[a-z0-9])", re.I)
 
 _chosen_model: Optional[str] = None     # cached per process once a model has worked
+_reachable: Optional[bool] = None       # cached answer of available()
 
 
 class LLMError(RuntimeError):
@@ -43,7 +50,7 @@ class LLMError(RuntimeError):
 
 
 class NoAPIKey(LLMError):
-    pass
+    """Neither the code nor the environment supplied a key: Google refused the call."""
 
 
 class ModelUnavailable(LLMError):
@@ -67,14 +74,26 @@ def api_key() -> Optional[str]:
 
 
 def key_source() -> str:
-    """Where the key came from — for the UI to say *that* there is a key, never what it is."""
+    """Where the key comes from — for the UI to say *that* there is one, never what it is."""
     if os.environ.get("GEMINI_API_KEY", "").strip():
         return "environment (GEMINI_API_KEY)"
-    return "Streamlit secrets" if api_key() else ""
+    if api_key():
+        return "Streamlit secrets"
+    return "a credential the environment adds to each request" if available() else ""
 
 
 def available() -> bool:
-    return api_key() is not None
+    """Can we call Gemini? True with a key in code; otherwise one ListModels call decides."""
+    global _reachable
+    if api_key():
+        return True
+    if _reachable is None:
+        try:
+            list_models(None)
+            _reachable = True
+        except LLMError:
+            _reachable = False
+    return _reachable
 
 
 # ---------------------------------------------------------------- transport
@@ -95,8 +114,11 @@ def _http(method: str, url: str, headers: Dict[str, str], body: Optional[bytes],
         raise LLMError(f"could not reach the Gemini API: {getattr(err, 'reason', err)}") from None
 
 
-def _call(method: str, path: str, key: str, payload: Optional[dict] = None) -> Dict[str, Any]:
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+def _call(method: str, path: str, key: Optional[str],
+          payload: Optional[dict] = None) -> Dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    if key:                      # otherwise the environment injects x-goog-api-key
+        headers["x-goog-api-key"] = key
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     for attempt in range(MAX_TRANSIENT_RETRIES + 1):
         status, data = _http(method, f"{API_ROOT}/{path}", headers, body, TIMEOUT_S)
@@ -104,14 +126,37 @@ def _call(method: str, path: str, key: str, payload: Optional[dict] = None) -> D
             return data
         message = _redact(str((data.get("error") or {}).get("message") or data), key)
         if status in (429, 500, 503) and attempt < MAX_TRANSIENT_RETRIES:
-            time.sleep(2 * (attempt + 1))
+            time.sleep(_retry_wait(data, message, attempt))
             continue
         if status == 404 and path.startswith("models/") and ":" in path:
             raise ModelUnavailable(path.split("/", 1)[1].split(":", 1)[0], message)
+        if status in (401, 403) and not key and ("API key" in message
+                                                 or "unregistered callers" in message):
+            raise NoAPIKey("no Gemini API key: set GEMINI_API_KEY, add it to "
+                           ".streamlit/secrets.toml, or configure it as an environment "
+                           "credential")
         if status in (401, 403) and "API key" in message:
             raise LLMError("the Gemini API rejected the key (check GEMINI_API_KEY)")
         raise LLMError(f"Gemini API {status}: {message}")
     raise LLMError("Gemini API kept failing")      # pragma: no cover - loop always returns
+
+
+def _retry_wait(data: Dict[str, Any], message: str, attempt: int) -> float:
+    """Google's own retry hint (RetryInfo.retryDelay, or 'retry in 26.3s'), else 2s, 4s."""
+    hint = None
+    for detail in (data.get("error") or {}).get("details") or []:
+        delay = str(detail.get("retryDelay", "")) if isinstance(detail, dict) else ""
+        if delay.endswith("s"):
+            try:
+                hint = float(delay[:-1])
+            except ValueError:
+                pass
+    if hint is None:
+        found = re.search(r"retry in ([\d.]+)\s*s", message, re.I)
+        hint = float(found.group(1)) if found else None
+    if hint is None:
+        return 2.0 * (attempt + 1)
+    return min(hint + 1.0, MAX_RETRY_WAIT_S)
 
 
 def _redact(text: str, key: str) -> str:
@@ -119,7 +164,7 @@ def _redact(text: str, key: str) -> str:
 
 
 # ---------------------------------------------------------------- models
-def list_models(key: str) -> List[dict]:
+def list_models(key: Optional[str]) -> List[dict]:
     out, token = [], ""
     while True:
         data = _call("GET", "models?pageSize=1000" + (f"&pageToken={token}" if token else ""),
@@ -169,15 +214,8 @@ def current_model(key: Optional[str] = None) -> str:
     if os.environ.get("GEMINI_MODEL", "").strip():
         return os.environ["GEMINI_MODEL"].strip()
     if _chosen_model is None:
-        _chosen_model = pick_model(list_models(key or _require_key()))
+        _chosen_model = pick_model(list_models(key if key is not None else api_key()))
     return _chosen_model
-
-
-def _require_key() -> str:
-    key = api_key()
-    if not key:
-        raise NoAPIKey("no Gemini API key: set GEMINI_API_KEY or add it to .streamlit/secrets.toml")
-    return key
 
 
 # ---------------------------------------------------------------- generation
@@ -186,7 +224,7 @@ def generate_json(prompt: str, schema: dict, *, pdf_bytes: Optional[bytes] = Non
                   temperature: float = 0.0) -> Tuple[Any, str]:
     """One structured call. Returns (parsed JSON with Decimal numbers, model actually used)."""
     global _chosen_model
-    key = _require_key()
+    key = api_key()             # None: the environment adds the key header
     parts: List[dict] = [{"text": prompt}]
     if pdf_bytes:
         parts.append({"inline_data": {"mime_type": "application/pdf",

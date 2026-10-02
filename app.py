@@ -136,9 +136,9 @@ def source_panel():
                 st.rerun()
             return
         if not llm.available():
-            st.info("No Gemini API key found. Set the GEMINI_API_KEY environment variable, or "
-                    "add GEMINI_API_KEY to .streamlit/secrets.toml, and restart. The offline "
-                    "demo works without one.")
+            st.info("Gemini is not reachable with a key. Set the GEMINI_API_KEY environment "
+                    "variable, add GEMINI_API_KEY to .streamlit/secrets.toml, or configure it as "
+                    "an environment credential, and restart. The offline demo works without one.")
         else:
             st.caption(f"Gemini key: found in {llm.key_source()}.")
         if choice == "demo_pdfs":

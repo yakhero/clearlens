@@ -50,14 +50,14 @@ class FakeAPI:
 
 def run(fake, fn, env=None):
     saved_http, saved_env = llm._http, dict(os.environ)
-    llm._http, llm._chosen_model = fake, None
+    llm._http, llm._chosen_model, llm._reachable = fake, None, None
     os.environ.pop("GEMINI_MODEL", None)
     os.environ["GEMINI_API_KEY"] = KEY
     os.environ.update(env or {})
     try:
         return fn()
     finally:
-        llm._http, llm._chosen_model = saved_http, None
+        llm._http, llm._chosen_model, llm._reachable = saved_http, None, None
         os.environ.clear()
         os.environ.update(saved_env)
 
@@ -203,19 +203,62 @@ def test_key_is_redacted_from_error_messages():
     raise AssertionError
 
 
-def test_no_key_is_a_clear_error_and_makes_no_request():
-    fake = FakeAPI()
-
-    def call():
+def no_key_in_code(fn):
+    def wrapped():
         os.environ.pop("GEMINI_API_KEY", None)
-        return llm.generate_json("hi", SCHEMA)
+        return fn()
+    return wrapped
+
+
+class InjectingEnvironment(FakeAPI):
+    """The deployment's proxy adds x-goog-api-key; without it Google says 403."""
+
+    def __init__(self, injects: bool, **kw):
+        super().__init__(**kw)
+        self.injects = injects
+
+    def __call__(self, method, url, headers, body, timeout):
+        if "x-goog-api-key" not in headers and not self.injects:
+            self.calls.append({"method": method, "url": url, "headers": dict(headers),
+                               "body": None})
+            return 403, {"error": {"code": 403, "status": "PERMISSION_DENIED", "message":
+                                   "Method doesn't allow unregistered callers (callers without "
+                                   "established identity). Please use API Key or other form "
+                                   "of API consumer identity to call this API."}}
+        return super().__call__(method, url, headers, body, timeout)
+
+
+def test_without_a_key_in_code_the_request_goes_out_for_the_environment_to_sign():
+    fake = InjectingEnvironment(injects=True)
+    data, model = run(fake, no_key_in_code(lambda: llm.generate_json("hi", SCHEMA)))
+    assert model == "gemini-2.5-flash" and data == {"n": Decimal("1.10")}
+    assert all("x-goog-api-key" not in c["headers"] for c in fake.calls)
+
+
+def test_without_any_key_google_refuses_and_we_say_so():
+    fake = InjectingEnvironment(injects=False)
     try:
-        run(fake, call)
+        run(fake, no_key_in_code(lambda: llm.generate_json("hi", SCHEMA)))
     except llm.NoAPIKey as err:
-        assert "GEMINI_API_KEY" in str(err)
-        assert fake.calls == []
+        assert "GEMINI_API_KEY" in str(err) and "environment credential" in str(err)
         return
     raise AssertionError
+
+
+def test_available_probes_once_when_the_code_has_no_key():
+    signed = InjectingEnvironment(injects=True)
+
+    def twice():
+        return llm.available(), llm.available(), llm.key_source()
+    first, second, source = run(signed, no_key_in_code(twice))
+    assert first and second and "environment adds" in source
+    assert len(signed.calls) == 1                     # cached after the first ListModels
+    assert run(InjectingEnvironment(injects=False), no_key_in_code(llm.available)) is False
+
+
+def test_a_key_in_code_needs_no_probe():
+    fake = FakeAPI()
+    assert run(fake, llm.available) is True and fake.calls == []
 
 
 def test_key_source_names_the_source_not_the_key():
@@ -227,3 +270,24 @@ def test_client_uses_only_the_standard_library():
     src = (Path(__file__).resolve().parents[1] / "core" / "llm.py").read_text(encoding="utf-8")
     for banned in ("import requests", "google.generativeai", "google.genai", "httpx"):
         assert banned not in src
+
+
+def test_rate_limit_waits_as_long_as_google_asks():
+    waits = []
+    quota = {"error": {"code": 429, "message": "Quota exceeded. Please retry in 26.37s.",
+                       "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "26s"}]}}
+    assert llm._retry_wait(quota, quota["error"]["message"], 0) == 27.0
+    assert llm._retry_wait({}, "Please retry in 12.5s.", 0) == 13.5
+    assert llm._retry_wait({}, "overloaded", 1) == 4.0
+    assert llm._retry_wait({}, "Please retry in 900s.", 0) == llm.MAX_RETRY_WAIT_S
+
+    answers = iter([(429, quota), (200, reply('{"n": 2}'))])
+    saved = llm.time.sleep
+    llm.time.sleep = waits.append
+    try:
+        data, _ = run(lambda *a: next(answers),
+                      lambda: llm.generate_json("hi", SCHEMA, model="gemini-2.5-flash"))
+    finally:
+        llm.time.sleep = saved
+    assert data == {"n": 2} and waits == [27.0]
