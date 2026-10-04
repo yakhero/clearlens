@@ -1,0 +1,40 @@
+{
+  "doc_type": "bill_of_lading",
+  "sha256": "c3412d9eae088b913efd64356e442dd1599ff21c8f89d73dc5057b53c59aa59e",
+  "model": "gemini-3.5-flash-lite",
+  "pages": 2,
+  "created": "2026-10-04T13:33:14Z",
+  "note": "Raw model output. Citations are re-verified in code on every load.",
+  "lines": [
+    {
+      "line_no": 1,
+      "description": "FRESH GARLIC NORMAL WHITE IN MESH BAGS",
+      "quantity": "1,200",
+      "unit": "BAGS",
+      "gross_weight_kg": "12,360.000",
+      "origin": "P.R. CHINA",
+      "page": 1,
+      "quote": "      1,200 BAGS FRESH GARLIC NORMAL WHITE IN MESH BAGS                               12,360.000     38.400 CBM"
+    },
+    {
+      "line_no": 2,
+      "description": "FRESH GARLIC PURE WHITE IN MESH BAGS",
+      "quantity": "800",
+      "unit": "BAGS",
+      "gross_weight_kg": "8,240.000",
+      "origin": "P.R. CHINA",
+      "page": 1,
+      "quote": "       800 BAGS FRESH GARLIC PURE WHITE IN MESH BAGS                                   8,240.000     25.600 CBM"
+    },
+    {
+      "line_no": 3,
+      "description": "DEHYDRATED GARLIC FLAKES IN CARTONS",
+      "quantity": "150",
+      "unit": "CARTONS",
+      "gross_weight_kg": "3,180.000",
+      "origin": "P.R. CHINA",
+      "page": 1,
+      "quote": "   150 CARTONS DEHYDRATED GARLIC FLAKES IN CARTONS                                   3,180.000      6.750 CBM"
+    }
+  ]
+}
