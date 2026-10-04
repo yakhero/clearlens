@@ -16,6 +16,14 @@ data/cache/*.json
 !data/cache/.gitkeep
 data/consignments/*.pdf
 !data/consignments/.gitkeep
+# generated from mock.json by core/demo_docs.py — fictional, kept so the demo runs offline
+!data/consignments/demo_*.pdf
+# extraction cache: answers for uploaded documents stay local; the demo set is committed
+# so the demo runs end to end with the API unavailable (names are the PDFs' SHA-256)
+data/consignments/cache/*
+!data/consignments/cache/8aab3c5c0218fb6781c407c787bab81947a79f63ab7fa739bf75700b45ffa7ca.invoice.json
+!data/consignments/cache/6a1ff7cedc23ac19ee23b8cc1e7f3db9a505c89b663daf1d245be7b5d2b57b58.packing_list.json
+!data/consignments/cache/c3412d9eae088b913efd64356e442dd1599ff21c8f89d73dc5057b53c59aa59e.bill_of_lading.json
 # the FBR tariff is a public document and the parser's input — keep it in the repo
 !data/tariff/pakistan_customs_tariff_2026-27.pdf
 .DS_Store
