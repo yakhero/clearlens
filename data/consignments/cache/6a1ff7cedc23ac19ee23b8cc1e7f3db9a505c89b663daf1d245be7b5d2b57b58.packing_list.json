@@ -1,0 +1,55 @@
+{
+  "doc_type": "packing_list",
+  "sha256": "6a1ff7cedc23ac19ee23b8cc1e7f3db9a505c89b663daf1d245be7b5d2b57b58",
+  "model": "gemini-3.5-flash-lite",
+  "pages": 1,
+  "created": "2026-10-04T13:32:45Z",
+  "note": "Raw model output. Citations are re-verified in code on every load.",
+  "lines": [
+    {
+      "line_no": 1,
+      "description": "GARLIC FRESH PURE WHITE 5.5CM UP (10KG MESH BAGS)",
+      "quantity": "800",
+      "unit": "BAGS",
+      "unit_price": "",
+      "currency": "",
+      "value": "",
+      "net_weight_kg": "8,000.00",
+      "gross_weight_kg": "8,240.00",
+      "origin": "CHINA",
+      "incoterm": "",
+      "page": 1,
+      "quote": " 1    GARLIC FRESH PURE WHITE 5.5CM UP (10KG MESH BAGS)                                    800 BAGS              8,000.00              8,240.00  CHINA"
+    },
+    {
+      "line_no": 2,
+      "description": "GARLIC FLAKES DEHYDRATED GRADE A (20KG CTN)",
+      "quantity": "150",
+      "unit": "CTNS",
+      "unit_price": "",
+      "currency": "",
+      "value": "",
+      "net_weight_kg": "2,950.00",
+      "gross_weight_kg": "3,180.00",
+      "origin": "CHINA",
+      "incoterm": "",
+      "page": 1,
+      "quote": " 2    GARLIC FLAKES DEHYDRATED GRADE A (20KG CTN)                                          150 CTNS              2,950.00              3,180.00  CHINA"
+    },
+    {
+      "line_no": 3,
+      "description": "GARLIC FRESH NORMAL WHITE 5.0CM UP (10KG MESH BAGS)",
+      "quantity": "1,180",
+      "unit": "BAGS",
+      "unit_price": "",
+      "currency": "",
+      "value": "",
+      "net_weight_kg": "12,000.00",
+      "gross_weight_kg": "12,360.00",
+      "origin": "CHINA",
+      "incoterm": "",
+      "page": 1,
+      "quote": " 3    GARLIC FRESH NORMAL WHITE 5.0CM UP (10KG MESH BAGS)                                    1,180 BAGS            12,000.00            12,360.00  CHINA"
+    }
+  ]
+}
